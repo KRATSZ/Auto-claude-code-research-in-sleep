@@ -46,12 +46,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.request
@@ -323,6 +325,28 @@ def rebuild_query_pack(wiki_root: str, max_chars: int = 8000):
             failed_text = "\n".join(failed)[:1400]
             sections.append(f"## Failed Ideas (avoid repeating)\n{failed_text}\n")
 
+    # Recent measured failures are scoped to their actual comparison.
+    trial_notes = []
+    for trial in sorted((root / "trials").glob("*.json"),
+                        key=lambda path: (path.stat().st_mtime, path.name), reverse=True):
+        try:
+            record = json.loads(trial.read_text(encoding="utf-8"))
+            if record["outcome"] != "below_threshold":
+                continue
+            note = (f"- {trial.stem}: {record['hypothesis'][:85]} | {record['change'][:85]} | "
+                    f"scope: {record['scope'][:85]} | delta: {record['delta']} | "
+                    f"cause ({record['cause_status']}): {record['cause'][:85]}")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        note = " ".join(note.split())
+        if scan_for_threats is not None and not scan_for_threats(note, scope="strict"):
+            trial_notes.append(note[:450])
+        if len(trial_notes) == 4:
+            break
+    if trial_notes:
+        sections.append("## Measured Trial Failures (recheck scope before retrying)\n"
+                        + "\n".join(trial_notes) + "\n")
+
     # 4. Paper summaries (1800 chars) — top by relevance
     papers_dir = root / "papers"
     if papers_dir.exists():
@@ -404,7 +428,10 @@ def rebuild_query_pack(wiki_root: str, max_chars: int = 8000):
             )
 
     pack_path = root / "query_pack.md"
-    pack_path.write_text(pack, encoding="utf-8")
+    with tempfile.TemporaryDirectory(dir=pack_path.parent) as staging:
+        pending = Path(staging) / pack_path.name
+        pending.write_text(pack, encoding="utf-8")
+        pending.replace(pack_path)
     print(f"query_pack.md rebuilt: {len(pack)} chars")
 
 
@@ -1436,6 +1463,61 @@ def add_experiment(wiki_root: str, slug: str, *, title: str = "", idea: str = ""
     return page_path
 
 
+def record_trial(root: Path, trial_id: str, contract: str, *, hypothesis: str,
+                 change: str, scope: str, cause: str, cause_status: str, revision: str,
+                 receipt: Path | None, failed_log: Path | None) -> Path:
+    """Keep one immutable evidence record per attempt, including unscored runs."""
+    # Load only for this subcommand so existing standalone wiki copies still run.
+    try:
+        from .eval_contract import SHA256, file_digest, parse_json, valid_metrics, write_once_json
+    except ImportError:
+        from eval_contract import SHA256, file_digest, parse_json, valid_metrics, write_once_json
+
+    if not (root / "experiments").is_dir():
+        raise ValueError("initialize the research wiki before recording a trial")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", trial_id):
+        raise ValueError("trial id must use lowercase letters, digits, dashes or underscores")
+    if not SHA256.fullmatch(contract):
+        raise ValueError("expected a pinned SHA-256 for the evaluation contract")
+    if cause_status not in ("confirmed", "tentative", "unknown"):
+        raise ValueError("cause status must be confirmed, tentative, or unknown")
+    fields = dict(hypothesis=hypothesis, change=change, scope=scope, cause=cause, revision=revision)
+    if any(not value.strip() for value in fields.values()):
+        raise ValueError("hypothesis, change, scope, cause, and revision are required")
+    if (receipt is None) == (failed_log is None):
+        raise ValueError("supply one score receipt or failed-run log")
+    evidence = receipt if receipt is not None else failed_log
+    if evidence.is_symlink() or not evidence.is_file() or evidence.stat().st_size == 0:
+        raise ValueError("evidence must be a nonempty regular file")
+    evidence_path = os.path.relpath(evidence.resolve(), root.resolve())
+    raw = receipt.read_bytes() if receipt is not None else None
+    evidence_digest = hashlib.sha256(raw).hexdigest() if raw is not None else file_digest(evidence)
+    record = dict(fields, schema=1, trial_id=trial_id, contract_sha256=contract,
+                  outcome="unscored", delta=None, cause_status=cause_status,
+                  evidence=evidence_path, evidence_sha256=evidence_digest)
+    if raw is not None:
+        score = parse_json(raw)
+        if (not isinstance(score, dict) or score.get("schema") != 1 or
+                score.get("contract_sha256") != contract or
+                not SHA256.fullmatch(str(score.get("artifact_sha256"))) or
+                score.get("status") not in ("pass", "below_threshold", "error")):
+            raise ValueError("score receipt must belong to the pinned contract")
+        if score["status"] != "error":
+            metrics = [score.get(key) for key in ("baseline", "metrics", "delta")]
+            if (not all(valid_metrics(value) for value in metrics) or
+                    not metrics[0].keys() == metrics[1].keys() == metrics[2].keys() or
+                    not isinstance(score.get("primary_metric"), str) or
+                    score["primary_metric"] not in metrics[0]):
+                raise ValueError("score receipt is missing frozen numeric metrics")
+            record.update(baseline=score["baseline"], metrics=score["metrics"], delta=score["delta"])
+        record.update(outcome=score["status"], artifact_sha256=score["artifact_sha256"])
+    output = root / "trials" / f"{trial_id}.json"
+    write_once_json(output, record)
+    rebuild_index(str(root))
+    rebuild_query_pack(str(root))
+    return output
+
+
 def sync_papers(wiki_root: str, arxiv_ids: list[str], update_on_exist: bool = False) -> None:
     """Batch backfill: ingest many arxiv ids with a SINGLE metadata request.
 
@@ -1497,6 +1579,10 @@ def rebuild_index(wiki_root: str) -> None:
             lines.extend(entries)
             lines.append("")
 
+    trials = sorted((root / "trials").glob("*.json"))
+    if trials:
+        lines.extend([f"## Frozen Evaluation Trials ({len(trials)})", ""])
+        lines.extend(f"- [{p.stem}](trials/{p.name})" for p in trials)
     (root / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1648,6 +1734,17 @@ def main():
     p_exp.add_argument("--update-on-exist", action="store_true",
                        help="Overwrite an existing experiment (the verdict owner /result-to-claim passes this on a re-judge)")
 
+    p_trial = subparsers.add_parser("record_trial", help="Record a frozen-evaluation attempt")
+    p_trial.add_argument("wiki_root", type=Path)
+    p_trial.add_argument("--id", required=True)
+    p_trial.add_argument("--contract-sha256", required=True)
+    for name in ("hypothesis", "change", "scope", "cause", "revision"):
+        p_trial.add_argument(f"--{name}", required=True)
+    p_trial.add_argument("--cause-status", choices=("confirmed", "tentative", "unknown"), required=True)
+    p_evidence = p_trial.add_mutually_exclusive_group(required=True)
+    p_evidence.add_argument("--receipt", type=Path)
+    p_evidence.add_argument("--failed-log", type=Path)
+
     # sync — batch backfill
     p_sync = subparsers.add_parser("sync",
                                     help="Batch ingest from a list of arXiv IDs")
@@ -1709,6 +1806,16 @@ def main():
                        reasoning=args.reasoning, provenance=args.provenance,
                        tags=[x.strip() for x in args.tags.split(",") if x.strip()],
                        update_on_exist=args.update_on_exist)
+    elif args.command == "record_trial":
+        try:
+            trial = record_trial(args.wiki_root, args.id, args.contract_sha256,
+                                 hypothesis=args.hypothesis, change=args.change,
+                                 scope=args.scope, cause=args.cause, cause_status=args.cause_status,
+                                 revision=args.revision, receipt=args.receipt, failed_log=args.failed_log)
+        except (OSError, ValueError) as exc:
+            print(f"TRIAL_RECORD_ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print(f"TRIAL_RECORD_OK {trial}")
     elif args.command == "sync":
         ids: list[str] = []
         if args.arxiv_ids:

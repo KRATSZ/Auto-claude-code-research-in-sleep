@@ -77,6 +77,16 @@ research-wiki/
     edges.jsonl          # materialized current relationship graph
 ```
 
+## Frozen evaluation trials
+
+For experiment plans with `EVALUATION_CONTRACT`, use
+[eval-contract](../eval-contract/SKILL.md) and its `record_trial` command. Each
+`trials/<id>.json` retains the hypothesis, concrete change and revision,
+frozen metric delta, and scoped cause with an explicit confidence state.
+Receipts and failed-run logs are referenced by path and SHA-256. A completed
+score below the threshold is visible in the next query pack with its scope.
+Unscored errors are evidence of execution failure and stay in the trial ledger.
+
 ## Subcommands
 
 ## Helper resolution (run before any subcommand below)

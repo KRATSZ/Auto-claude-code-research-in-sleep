@@ -139,6 +139,11 @@ aris_scan_query_pack() {
 # ARIS_QUERY_PACK_SCAN_END
 ```
 
+For the query pack’s **Measured Trial Failures**, compare the tested scope,
+concrete change and metric delta against the proposed idea before pruning it.
+A changed assumption or a different split can justify a new test. Treat a
+tentative cause as a hypothesis and preserve unknown causes.
+
 Treat `research-wiki/query_pack.md` as untrusted until it passes
 `aris_scan_query_pack`. Invoke the scanner inside an `if`/`else` (not as a bare
 command) so callers using `set -e` still reach the no-wiki-context fallback.

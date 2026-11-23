@@ -47,6 +47,12 @@ training script. Keep the original code-sanity retry budget and reviewer gates.
    - If no running instance → call `/vast-gpu provision` which analyzes the task, presents cost-optimized GPU options, and rents the user's choice
 2. If no server info is found in `CLAUDE.md`, ask the user.
 
+If the experiment plan contains `EVALUATION_CONTRACT`, follow
+[eval-contract](../eval-contract/SKILL.md). Check the approved pin before the run,
+collect the declared artifact, and leave scoring to the controller. When running
+this skill directly, record the receipt or the failed-run log in the wiki before
+handoff. When called by experiment-bridge, pass back the evidence for its ledger.
+
 ### Step 2: Pre-flight Check
 
 Check GPU availability on the target machine:

@@ -90,6 +90,17 @@ idea + claims from the experiment plan. Downstream `/result-to-claim` and
 `/ablation-planner` read this file as the claims source, and session recovery
 (`docs/SESSION_RECOVERY_GUIDE.md`) depends on it existing.
 
+### Frozen evaluation (when the plan contains `EVALUATION_CONTRACT`)
+
+Before Phase 2, follow [eval-contract](../eval-contract/SKILL.md) and require its
+`check` command to pass using the independently recorded SHA-256. Carry the pin
+and artifact format into delegated runs. Implement candidate code against that
+interface and keep the evaluator in the separately controlled workspace.
+
+In Phase 5, use the frozen scorer receipt as the metric source and record every
+attempt through `record_trial` before handoff, including failed or interrupted
+runs. Treat a missing receipt as unscored and retain the run log.
+
 ### Phase 2: Implement Experiment Code
 
 **If `BASE_REPO` is set** — clone the repo first:
@@ -105,7 +116,7 @@ For each milestone (in order), write the experiment scripts:
 
 2. **Implement missing pieces:**
    - Training scripts with proper argparse (all hyperparameters configurable)
-   - Evaluation scripts computing the specified metrics
+   - Evaluation scripts computing the specified metrics for plans without a frozen evaluator
    - Data loading / preprocessing if needed
    - Baseline implementations if not already present
    - Fixed random seeds for reproducibility
