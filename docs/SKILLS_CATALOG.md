@@ -1,6 +1,6 @@
 # ARIS Skills Catalog
 
-Every skill that ships with ARIS, grouped by role. **88 skills** as of the
+Every skill that ships with ARIS, grouped by role. **91 skills** as of the
 latest update; new skills land via PR and get added to the table below.
 
 - Each `Skill` link goes to the canonical `SKILL.md` (the LLM-readable spec).
@@ -27,6 +27,9 @@ End-to-end pipelines that chain many sub-skills. Most users start here.
 | [`/research-pipeline`](../skills/research-pipeline/SKILL.md) | **Full chain** — Workflow 1 → 1.5 → 2 → 3, from research direction to submission-ready paper | Codex MCP, LaTeX, GPU |
 | [`/idea-discovery`](../skills/idea-discovery/SKILL.md) | **Workflow 1** — research-lit → idea-creator → novelty-check → research-review → research-refine-pipeline | Codex MCP |
 | [`/idea-discovery-robot`](../skills/idea-discovery-robot/SKILL.md) | Workflow 1 adapter for robotics / embodied AI — robotics-aware literature survey + benchmark-anchored ideation | Codex MCP |
+| [`/data-probe`](../skills/data-probe/SKILL.md) | Measure existing baselines and surface concrete bad cases before ideation | Python 3 |
+| [`/tree-search`](../skills/tree-search/SKILL.md) | Explore candidate worktrees with a bounded Draft, Improve, and Debug loop | Python 3 and Git |
+| [`/dream-consolidate`](../skills/dream-consolidate/SKILL.md) | Carry cross-branch observations and untested recombinations into the next round | Python 3 and Git |
 | [`/eval-contract`](../skills/eval-contract/SKILL.md) | Freeze a reviewed evaluator and baseline, score artifacts, and record each attempt | Python 3 |
 | [`/experiment-bridge`](../skills/experiment-bridge/SKILL.md) | **Workflow 1.5** — read experiment plan → implement code → sanity check → deploy to GPU → collect initial results | GPU (local / remote / Vast / Modal) |
 | [`/auto-review-loop`](../skills/auto-review-loop/SKILL.md) | **Workflow 2** — autonomous review → fix → re-review until positive or max rounds; uses Codex MCP reviewer | Codex MCP |

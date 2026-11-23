@@ -347,6 +347,21 @@ def rebuild_query_pack(wiki_root: str, max_chars: int = 8000):
         sections.append("## Measured Trial Failures (recheck scope before retrying)\n"
                         + "\n".join(trial_notes) + "\n")
 
+    lessons = []
+    for path in sorted((root / "dreams").glob("*/round.json"), reverse=True):
+        try:
+            cycle = json.loads(path.read_text(encoding="utf-8"))
+            for item in cycle["lessons"]:
+                note = (f"- {path.parent.name}/{item['id']} ({item['confidence']}): "
+                        f"{item['observation'][:150]} | scope: {item['scope'][:100]}")
+                if scan_for_threats is not None and not scan_for_threats(note, scope="strict"):
+                    lessons.append(" ".join(note.split()))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    if lessons:
+        sections.append("## Cross-Branch Observations (see the original comparisons)\n"
+                        + "\n".join(lessons[:4]) + "\n")
+
     # 4. Paper summaries (1800 chars) — top by relevance
     papers_dir = root / "papers"
     if papers_dir.exists():
@@ -1583,6 +1598,17 @@ def rebuild_index(wiki_root: str) -> None:
     if trials:
         lines.extend([f"## Frozen Evaluation Trials ({len(trials)})", ""])
         lines.extend(f"- [{p.stem}](trials/{p.name})" for p in trials)
+        lines.append("")
+    probes = sorted((root / "probes").glob("*/probe.json"))
+    if probes:
+        lines.extend(["## Real Baseline Probes", ""])
+        lines.extend(f"- [{path.parent.name}](probes/{path.parent.name}/probe.json)" for path in probes)
+        lines.append("")
+    dreams = sorted((root / "dreams").glob("*/dream_pool.md"))
+    if dreams:
+        lines.extend(["## Consolidated Rounds", ""])
+        lines.extend(f"- [{path.parent.name}](dreams/{path.parent.name}/dream_pool.md) · "
+                     f"[observations](dreams/{path.parent.name}/round.json)" for path in dreams)
     (root / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

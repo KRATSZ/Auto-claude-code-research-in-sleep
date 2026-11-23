@@ -145,6 +145,12 @@ phase and re-run the gate before finalizing.
 
 ### Phase 0: Load Research Brief (if available)
 
+When invoked with `research-cycle: true`, run [data-probe](../data-probe/SKILL.md)
+first, or verify the supplied probe's usable receipt and unchanged real inputs.
+Read the observed bottlenecks into the brief before the literature survey and
+candidate generation. Carry the probe path into the shortlisted candidates.
+
+
 Before starting any other phase, check for a detailed research brief in the project:
 
 1. Look for `RESEARCH_BRIEF.md` in the project root or a path passed in `$ARGUMENTS`.

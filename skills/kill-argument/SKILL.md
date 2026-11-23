@@ -72,6 +72,20 @@ This skill is most valuable for **theory papers** with ≥5 theorem-class enviro
 
 ## Workflow
 
+## Research SPEC mode
+
+When invoked with `spec: <path to SPEC.md>`, use the named Markdown SPEC and
+its cited baseline evidence as the reviewed input. Skip the paper inventory,
+compile and PDF steps. Keep the fresh attack and adjudication roles. In both
+prompts, review the demonstrated bottleneck, closest prior work, strongest
+control, falsifier and feasibility. Evaluate the proposed test and supplied
+baseline evidence at their stated scope. Preserve the usual review routing,
+actual model identities, independence classification and computed verdict.
+Write the usual reports beside the SPEC and include
+`"SPEC.md": "sha256:<digest>"` (using the actual basename) in
+`audited_input_hashes`. A tree round requires a current accepted cross-family
+PASS. Apply the normal paper discovery and compile rules only for paper input.
+
 ### Step 1: Discover paper files
 
 Locate the paper directory and inventory the source.

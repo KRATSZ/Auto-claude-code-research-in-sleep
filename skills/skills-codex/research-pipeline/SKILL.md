@@ -134,13 +134,33 @@ completion. After each tick run `iteration_log.py note <root> <run_id> <phase>
 `pivot=human` surfaces the stall. Neither result is a quality verdict. See
 [`resumable-runs.md`](../shared-references/resumable-runs.md).
 
+## Research cycle mode
+
+With `research-cycle: true`, start with [data-probe](../data-probe/SKILL.md) on
+existing baselines, then pass `research-cycle: true` and the usable probe path into Stage 1 idea-discovery. The usual
+literature survey and novelty checks still apply. Shortlist the top one or two
+candidates and write a `SPEC.md` with the evidence, falsifier, baseline, metrics,
+and budget. Route each selected SPEC through
+[kill-argument](../kill-argument/SKILL.md) in SPEC mode using a cross-family
+review. Only a current accepted PASS proceeds to
+[eval-contract](../eval-contract/SKILL.md).
+
+For Stage 2, use [tree-search](../tree-search/SKILL.md) with that SPEC, review,
+probe and frozen evaluator instead of the single execution path. Start 3–5
+different Draft routes, then Improve the strongest scored branch and Debug
+concrete execution failures inside the declared budget. Use the closed
+`tree.json` and Wiki trial records as Stage 2 evidence. After each closed round,
+run [dream-consolidate](../dream-consolidate/SKILL.md) before the next round.
+Use the selected commit and frozen evidence at the usual claim and review gates.
+The next Draft can reference a seed from the topic's `dream_pool.md`.
+
 ## Pipeline
 
 ### Stage 1: Idea Discovery (Workflow 1)
 
 If `RESEARCH_BRIEF.md` exists in the project root, it will be automatically loaded as detailed context (replaces one-line prompt). See `templates/RESEARCH_BRIEF_TEMPLATE.md`.
 
-Invoke the idea discovery pipeline:
+For research cycle mode, pass its mode flag and verified probe receipt to idea-discovery. Invoke the idea discovery pipeline:
 
 ```
 /idea-discovery "$ARGUMENTS" — AUTO_PROCEED: $AUTO_PROCEED
@@ -180,6 +200,9 @@ The user may:
 > ⚠️ **This gate waits for user confirmation when AUTO_PROCEED=false.** When `true`, it auto-proceeds after presenting results. The rest of the pipeline (Stages 2-3) is expensive (GPU time + multiple review rounds), so set `AUTO_PROCEED=false` if you want a final review checkpoint before committing GPU resources.
 
 ### Stage 2: Experiment Bridge (Workflow 1.5)
+
+Research cycle mode uses the tree controller and round evidence specified above.
+The direct experiment-bridge procedure below is for the standard pipeline.
 
 Once the idea is selected (automatically or by the user), delegate implementation and deployment to `/experiment-bridge`:
 

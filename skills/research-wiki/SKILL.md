@@ -87,6 +87,15 @@ Receipts and failed-run logs are referenced by path and SHA-256. A completed
 score below the threshold is visible in the next query pack with its scope.
 Unscored errors are evidence of execution failure and stay in the trial ledger.
 
+## Research cycle memory
+
+The Wiki index links to `probes/<id>/probe.json` for real baseline evidence and
+to `dreams/<round>/round.json` for cross-branch observations. Consolidated
+observations enter the query pack with their original scope and confidence.
+Open `dreams/<round>/dream_pool.md` to pick an untested seed for a future Draft.
+Use the [probe](../data-probe/SKILL.md) and
+[consolidation](../dream-consolidate/SKILL.md) helpers to create these artifacts.
+
 ## Subcommands
 
 ## Helper resolution (run before any subcommand below)
