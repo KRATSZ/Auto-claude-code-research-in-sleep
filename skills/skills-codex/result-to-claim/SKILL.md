@@ -199,9 +199,8 @@ if research-wiki/ exists:
     [ -n "$WIKI_SCRIPT" ] || echo "WARN: research_wiki.py unreachable; skipping wiki writes (verdict still reported)." >&2
 
     # 1. Create/refresh the experiment node FIRST (verdict OWNER → --update-on-exist so a
-    #    re-judge overwrites the stale verdict). The supports/invalidates edges in #2 point
-    #    FROM exp:<id> and add_edge does NOT verify node existence, so only add them if the
-    #    experiment node was born (EXP_NODE_OK); otherwise skip the wiki edges.
+    #    re-judge overwrites the stale verdict). Gate edges on EXP_NODE_OK
+    #    so they have an existing experiment source.
     EXP_NODE_OK=0
     [ -n "$WIKI_SCRIPT" ] && python3 "$WIKI_SCRIPT" add_experiment research-wiki/ \
          --slug "<exp_id>" --idea "idea:<active_idea>" \
@@ -210,18 +209,16 @@ if research-wiki/ exists:
          --metrics "<key metrics>" --reasoning "<one-line why this verdict>" \
          --provenance "<EXPERIMENT_AUDIT.md / run dir>" --update-on-exist && EXP_NODE_OK=1
 
-    # 2. Record empirical support as EDGES ONLY, and ONLY if EXP_NODE_OK. NEVER edit a
-    #    claim page's `status`: that is the PROOF axis (verified / refuted / unproven /
-    #    sound-modulo-imports / drafted / retracted), owned by /proof-checker (the claim
-    #    birth point) — the ARIS helper REJECTS "supported"/"partial"/"invalidated".
-    if [ "$EXP_NODE_OK" = 1 ]:
-        for each claim resolved by this verdict:
-            if verdict == "yes":
-                python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type supports --evidence "<metric>"
-            elif verdict == "partial":
-                python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type supports --evidence "partial: <metric>"
-            else:
-                python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type invalidates --evidence "<why>"
+    # 2. Link each scored trial that directly tests an existing scoped claim.
+    #    Require EXP_NODE_OK and a trials/<id>.json record with a verified score receipt.
+    #    Use the trial outcome for the edge type and its evidence_sha256 as the pin.
+    #    Keep unscored, error, or out-of-scope runs in the trial ledger.
+    for each matching trial and claim (only if [ "$EXP_NODE_OK" = 1 ]):
+        if trial.outcome == "pass":
+            python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type supports --trial-id "<trial_id>" --receipt-sha256 "<evidence_sha256>" --evidence "<metric>"
+        elif trial.outcome == "below_threshold":
+            python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "exp:<id>" --to "claim:<cid>" --type invalidates --trial-id "<trial_id>" --receipt-sha256 "<evidence_sha256>" --evidence "<metric>"
+        # Report a settled-claim or evidence error from add_edge in the verdict notes.
 
     # 3. Update idea outcome (raw markdown, helper-free — preserves the rich idea body)
     Update research-wiki/ideas/<idea_id>.md:

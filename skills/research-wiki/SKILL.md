@@ -24,7 +24,7 @@ Inspired by [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6
 | **Paper** | `papers/` | `paper:<slug>` | A published or preprint research paper |
 | **Idea** | `ideas/` | `idea:<id>` | A research idea (proposed, tested, or failed) |
 | **Experiment** | `experiments/` | `exp:<id>` | A concrete experiment run with results |
-| **Claim** | `claims/` | `claim:<id>` | A theorem/headline with an honest PROOF status — born via `/proof-checker` (see Hook 4) |
+| **Claim** | `claims/` | `claim:<id>` | A scoped claim with a verdict derived from scored trials |
 
 ### Typed Relationships (`graph/edges.jsonl`)
 
@@ -35,8 +35,8 @@ Inspired by [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6
 | `addresses_gap` | paper\|idea → gap | Targets a known field gap |
 | `inspired_by` | idea → paper | Idea sourced from this paper |
 | `tested_by` | idea\|claim → exp | Tested in this experiment |
-| `supports` | exp → claim\|idea | Experiment confirms claim |
-| `invalidates` | exp → claim\|idea | Experiment disproves claim |
+| `supports` | exp or trial → claim\|idea | A verified trial passed its frozen threshold |
+| `invalidates` | exp or trial → claim\|idea | A verified trial missed its frozen threshold |
 | `supersedes` | paper → paper | Newer work replaces older |
 
 Edges are stored in `graph/edges.jsonl` only. The `## Connections` section on each page is **auto-generated** from the graph — never hand-edit it.
@@ -86,6 +86,45 @@ frozen metric delta, and scoped cause with an explicit confidence state.
 Receipts and failed-run logs are referenced by path and SHA-256. A completed
 score below the threshold is visible in the next query pack with its scope.
 Unscored errors are evidence of execution failure and stay in the trial ledger.
+
+## Claim evidence and stopping rules
+
+Create the claim with `add_claim` and state the scope and frozen criterion.
+Set `--evidence-threshold` at creation to control when the claim settles.
+The default is 2. An existing claim keeps its original threshold.
+
+```bash
+python3 "$WIKI_SCRIPT" add_claim research-wiki/ --slug candidate-gain \
+  --name "Candidate meets the frozen gain criterion" --evidence-threshold 2
+python3 "$WIKI_SCRIPT" add_edge research-wiki/ --from "trial:<id>" \
+  --to "claim:candidate-gain" --type supports --trial-id "<id>" \
+  --receipt-sha256 "<evidence_sha256 from trials/<id>.json>"
+python3 "$WIKI_SCRIPT" claim_status research-wiki/ --slug candidate-gain
+```
+
+Use `supports` for `pass` and `invalidates` for `below_threshold`. The
+helper verifies the trial ID, contract, numeric outcome and the SHA-256 of
+the actual score receipt. Place the receipt at the relative `evidence` path
+stored in the trial. Errors and unscored attempts stay in the trial ledger.
+Use only trials whose frozen metric, comparison and scope apply to the claim.
+
+The signed count of distinct verified receipts gives the claim status.
+A positive count gives `supported`, a negative count gives `refuted`, and
+a tie gives `open`. The absolute count reaching the threshold marks the
+claim `settled`. The helper rejects new edges at either endpoint of a settled
+claim and accepts retries of existing edges. The threshold counts distinct
+receipt digests. Assess scientific independence separately. The index and
+`claim_status` derive the status from the graph. `add_claim` rejects
+`--status`, and legacy page statuses have no effect on the verdict.
+
+Preview migration before writing. It adds `"legacy": true` to unpinned
+`supports` and `invalidates` rows, preserving their evidence text and order.
+Legacy rows contribute zero votes. Repeating the migration is safe.
+
+```bash
+python3 "$WIKI_SCRIPT" migrate_evidence research-wiki/ --dry-run
+python3 "$WIKI_SCRIPT" migrate_evidence research-wiki/
+```
 
 ## Research cycle memory
 
@@ -305,7 +344,6 @@ Update a specific entity:
 ```
 /research-wiki update paper:chen2025 — relevance: core
 /research-wiki update idea:001 — outcome: negative
-/research-wiki update claim:C1 — status: refuted
 ```
 
 After any update: rebuild `query_pack.md`, update `log.md`.
@@ -315,8 +353,8 @@ After any update: rebuild `query_pack.md`, update `log.md`.
 Health check the wiki:
 
 1. **Orphan pages** — entities with zero edges
-2. **Stale claims** — claims still `status: drafted` or `status: unproven` older than 14 days
-3. **Contradictions** — claims with both `supports` and `invalidates` edges
+2. **Stale claims** — claims still `open` after 14 days according to `claim_status`
+3. **Contradictions** — claims with verified receipts on both sides
 4. **Missing connections** — papers sharing 2+ tags but no explicit relationship
 5. **Dead ideas** — `stage: proposed` ideas that were never tested
 6. **Sparse pages** — pages with 3+ empty sections
@@ -411,19 +449,13 @@ EXP_NODE_OK = (python3 "$WIKI_SCRIPT" add_experiment research-wiki/ --slug <exp_
   --metrics <...> --reasoning <...> --provenance <run dir> --update-on-exist) succeeded
   # writes page + idea--tested_by-->exp edge + rebuilds index/query_pack
 
-# Record empirical support as EDGES ONLY, and ONLY if EXP_NODE_OK — never overwrite the
-# claim's `status`. A claim's `status` is the PROOF axis (verified / sound-modulo-imports
-# / refuted / unproven / drafted / retracted), owned by /proof-checker (the claim birth
-# point). Experiment support is a SEPARATE axis carried entirely by supports/invalidates
-# edges; writing "supported"/"invalidated" into status is rejected by the validator.
+# Link trial receipts only after the experiment node is available.
 if EXP_NODE_OK:
-    for claim_id in resolved_claims:
-        if verdict == "yes":
-            add_edge(exp_id, claim_id, "supports")
-        elif verdict == "partial":
-            add_edge(exp_id, claim_id, "supports")   # partial — qualify in --evidence
-        else:
-            add_edge(exp_id, claim_id, "invalidates")
+    for claim_id, trial in scoped_verified_trials:
+        if trial.outcome == "pass":
+            add_edge(exp_id, claim_id, "supports", trial.id, trial.evidence_sha256)
+        elif trial.outcome == "below_threshold":
+            add_edge(exp_id, claim_id, "invalidates", trial.id, trial.evidence_sha256)
 
 # Update idea outcome
 update_idea(active_idea_id, outcome=verdict)
@@ -436,24 +468,18 @@ rebuild query_pack
 log "result-to-claim: exp_id updated, verdict=..."
 ```
 
-### Hook 4: Claim birth — from `/proof-checker` (the ONLY birth point)
+### Hook 4: Claim birth from `/proof-checker`
 
-Wiki **claim nodes are born here.** `/proof-checker` Phase 5.5 calls `add_claim`
-for each top-level theorem/headline after writing `PROOF_AUDIT.json`, stamping an
-honest PROOF-axis `status` and a `provenance` pointer to the audit trace. No other
-skill creates a claim node: `/result-to-claim` (Hook 3) only adds empirical
-`supports`/`invalidates` *edges* to an already-born claim and never edits its `status`.
+`/proof-checker` Phase 5.5 calls `add_claim` for each top-level theorem
+after writing `PROOF_AUDIT.json`. The claim page records the statement,
+proof findings and a provenance pointer to the audit trace. Its empirical
+status comes from the scored trial evidence described above.
 
 ```bash
-# (run by /proof-checker; shown here for the wiki's record)
 python3 "$WIKI_SCRIPT" add_claim research-wiki/ --slug thm-main-ub \
-  --name "Main upper bound" --status verified \
-  --provenance ".aris/traces/proof-checker/<run>/" --statement "..." --update-on-exist
+  --name "Main upper bound" --provenance "<proof-checker trace dir>" \
+  --statement "..." --evidence "<proof audit findings and pointers>" --update-on-exist
 ```
-
-Claim `status` ∈ {`drafted`, `unproven`, `sound-modulo-imports`, `verified`,
-`refuted`, `retracted`} — the **proof axis only**. Empirical support is a separate
-axis, carried entirely by edges (Hook 3), never written into `status`.
 
 ## Re-ideation Trigger
 

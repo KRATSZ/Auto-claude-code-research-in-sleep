@@ -11,6 +11,8 @@ Usage:
     python3 research_wiki.py init <wiki_root>
     python3 research_wiki.py slug "<paper title>" --author "<last name>" --year 2025
     python3 research_wiki.py add_edge <wiki_root> --from <node_id> --to <node_id> --type <edge_type> --evidence "<text>"
+    python3 research_wiki.py claim_status <wiki_root> --slug <claim_slug>
+    python3 research_wiki.py migrate_evidence <wiki_root> [--dry-run]
     python3 research_wiki.py rebuild_query_pack <wiki_root> [--max-chars 8000]
     python3 research_wiki.py rebuild_index <wiki_root>
     python3 research_wiki.py stats <wiki_root>
@@ -31,7 +33,7 @@ Usage:
 
     # Claim layer (PROVE/JUDGE output ledger):
     python3 research_wiki.py add_claim <wiki_root> --slug b1-main-ub \
-        --name "..." --status sound-modulo-imports --provenance <run path> \
+        --name "..." --provenance <run path> [--evidence-threshold 2] \
         --statement "..." --scope "..." --evidence "..." \
         --addresses G2,G10 --extends paper:slug --uses paper:slug \
         --depends-on claim:other --refutes claim:bad
@@ -56,6 +58,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from contextlib import contextmanager, nullcontext
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -148,15 +151,217 @@ def init_wiki(wiki_root: str):
 
     # Create empty edges file
     edges_path = root / "graph" / "edges.jsonl"
-    if not edges_path.exists():
-        edges_path.write_text("", encoding="utf-8")
+    try:
+        with edges_path.open("x", encoding="utf-8"):
+            pass
+    except FileExistsError:
+        pass
 
     append_log(wiki_root, "Wiki initialized")
     print(f"Research wiki initialized at {root}")
 
 
-def add_edge(wiki_root: str, from_id: str, to_id: str, edge_type: str, evidence: str = ""):
+_EVIDENCE_OUTCOMES = {"supports": "pass", "invalidates": "below_threshold"}
+_DEFAULT_EVIDENCE_THRESHOLD = 2
+_TRIAL_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
+
+
+@contextmanager
+def _graph_lock(root: Path):
+    """Serialize graph checks and writes, including migration and settlement."""
+    with (root / "graph" / ".edges.lock").open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def _parse_edge(line: bytes) -> dict:
+    try:
+        edge = json.loads(line)
+    except (ValueError, UnicodeError):
+        return {}
+    if isinstance(edge, dict) and all(isinstance(edge.get(key), str)
+                                      for key in ("from", "to", "type")):
+        return edge
+    return {}
+
+
+def _graph_bytes(root: Path) -> bytes:
+    path = root / "graph" / "edges.jsonl"
+    return path.read_bytes() if path.exists() else b""
+
+
+def _read_edges(data: bytes) -> list[dict]:
+    return [edge for edge in map(_parse_edge, data.splitlines()) if edge]
+
+
+def _replace_file(path: Path, data: bytes) -> None:
+    """Publish a complete file while readers keep seeing the previous version."""
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging:
+        pending = Path(staging) / path.name
+        pending.write_bytes(data)
+        if path.exists():
+            shutil.copymode(path, pending)
+        pending.replace(path)
+
+
+def _append_graph(root: Path, data: bytes, lines: bytes) -> None:
+    separator = b"\n" if data and not data.endswith(b"\n") else b""
+    _replace_file(root / "graph" / "edges.jsonl", data + separator + lines)
+
+
+def _has_receipt_pin(edge: dict) -> bool:
+    return bool(edge.get("trial_id") and edge.get("receipt_sha256"))
+
+
+def migrate_evidence(wiki_root: str, *, dry_run: bool = False) -> int:
+    """Mark old unpinned evidence edges while preserving their content and order."""
+    root = Path(wiki_root)
+    with nullcontext() if dry_run else _graph_lock(root):
+        lines = _graph_bytes(root).splitlines(keepends=True)
+        count = 0
+        for index, line in enumerate(lines):
+            edge = _parse_edge(line)
+            if (edge.get("type") in _EVIDENCE_OUTCOMES and not edge.get("legacy")
+                    and not _has_receipt_pin(edge)):
+                edge["legacy"] = True
+                ending = line[len(line.rstrip(b"\r\n")):]
+                lines[index] = json.dumps(edge, ensure_ascii=False).encode("utf-8") + ending
+                count += 1
+        if count and not dry_run:
+            _replace_file(root / "graph" / "edges.jsonl", b"".join(lines))
+    return count
+
+
+def _claim_page(root: Path, node_id: str) -> Path:
+    prefix, _, slug = node_id.partition(":")
+    if prefix != "claim" or slug in ("", ".", "..") or "/" in slug or "\\" in slug:
+        raise ValueError(f"invalid claim ID: {node_id}")
+    return root / "claims" / f"{slug}.md"
+
+
+def _require_trial_receipt(root: Path, edge: dict) -> None:
+    """Validate the pin against the immutable trial and its score receipt."""
+    try:
+        from .eval_contract import SHA256, parse_json
+    except ImportError:
+        from eval_contract import SHA256, parse_json
+
+    trial_id = edge.get("trial_id")
+    receipt_digest = edge.get("receipt_sha256")
+    if not isinstance(trial_id, str) or not _TRIAL_ID.fullmatch(trial_id):
+        raise ValueError("evidence edge requires a valid --trial-id")
+    if not isinstance(receipt_digest, str) or not SHA256.fullmatch(receipt_digest):
+        raise ValueError("evidence edge requires a SHA-256 --receipt-sha256")
+    source = edge["from"]
+    if source.startswith("trial:") and source != f"trial:{trial_id}":
+        raise ValueError(f"source {source} does not match trial {trial_id}")
+
+    trial_path = root / "trials" / f"{trial_id}.json"
+    if trial_path.is_symlink() or not trial_path.is_file():
+        raise ValueError(f"missing regular trial record: {trial_path}")
+    record = parse_json(trial_path.read_bytes())
+    if (not isinstance(record, dict) or record.get("schema") != 1
+            or record.get("trial_id") != trial_id
+            or not SHA256.fullmatch(str(record.get("contract_sha256")))):
+        raise ValueError(f"invalid trial record: {trial_path}")
+    if record.get("evidence_sha256") != receipt_digest:
+        raise ValueError(f"receipt hash differs from trial {trial_id}")
+    if record.get("outcome") != _EVIDENCE_OUTCOMES[edge["type"]]:
+        raise ValueError(f"trial {trial_id} outcome {record.get('outcome')!r} "
+                         f"cannot justify {edge['type']}")
+
+    location = record.get("evidence")
+    if not isinstance(location, str) or not location or Path(location).is_absolute():
+        raise ValueError(f"trial {trial_id} requires a relative receipt path")
+    receipt = root / location
+    if receipt.is_symlink() or not receipt.is_file():
+        raise ValueError(f"missing regular score receipt: {receipt}")
+    raw = receipt.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != receipt_digest:
+        raise ValueError(f"receipt content hash differs for trial {trial_id}")
+    fields = _score_receipt_fields(raw, record["contract_sha256"])
+    if any(record.get(key) != value for key, value in fields.items()):
+        raise ValueError(f"receipt fields differ from trial {trial_id}")
+
+
+def _claim_state(root: Path, page: Path, edges: list[dict]) -> dict:
+    node_id = f"claim:{page.stem}"
+    threshold = int(_load_paper_frontmatter(page).get(
+        "evidence_threshold", _DEFAULT_EVIDENCE_THRESHOLD))
+    if threshold < 1:
+        raise ValueError(f"{node_id} evidence threshold must be positive")
+    receipts = {kind: set() for kind in _EVIDENCE_OUTCOMES}
+    for edge in edges:
+        kind = edge.get("type")
+        if (edge.get("to") == node_id and kind in receipts
+                and not edge.get("legacy") and _has_receipt_pin(edge)):
+            _require_trial_receipt(root, edge)
+            receipts[kind].add(edge["receipt_sha256"])
+    supporting = len(receipts["supports"])
+    refuting = len(receipts["invalidates"])
+    margin = supporting - refuting
+    status = "supported" if margin > 0 else "refuted" if margin < 0 else "open"
+    return dict(claim_id=node_id, status=status, settled=abs(margin) >= threshold,
+                evidence_threshold=threshold, supporting=supporting, refuting=refuting)
+
+
+def claim_status(wiki_root: str, slug: str) -> dict:
+    root = Path(wiki_root)
+    page = _claim_page(root, f"claim:{slug}")
+    if not page.is_file():
+        raise ValueError(f"claim does not exist: {slug}")
+    return _claim_state(root, page, _read_edges(_graph_bytes(root)))
+
+
+def _same_edge(edge: dict, existing: dict) -> bool:
+    keys = ("from", "to", "type")
+    if edge["type"] in _EVIDENCE_OUTCOMES:
+        if existing.get("legacy"):
+            return False
+        keys += ("trial_id", "receipt_sha256")
+    return all(edge[key] == existing.get(key) for key in keys)
+
+
+def _check_edge_extension(root: Path, edge: dict, existing: list[dict]) -> bool:
+    if any(_same_edge(edge, row) for row in existing):
+        return False
+    for node_id in dict.fromkeys((edge["from"], edge["to"])):
+        if node_id.startswith("claim:"):
+            page = _claim_page(root, node_id)
+            if page.is_file() and _claim_state(root, page, existing)["settled"]:
+                raise ValueError(f"{node_id} is settled; cannot add a new edge")
+    return True
+
+
+def add_edge(wiki_root: str, from_id: str, to_id: str, edge_type: str, evidence: str = "",
+             *, trial_id: str | None = None, receipt_sha256: str | None = None):
     """Add a typed edge to the relationship graph."""
+    root = Path(wiki_root)
+    edge = {"from": from_id, "to": to_id, "type": edge_type}
+    with _graph_lock(root):
+        data = _graph_bytes(root)
+        if edge_type in _EVIDENCE_OUTCOMES:
+            edge.update(trial_id=trial_id, receipt_sha256=receipt_sha256)
+            _require_trial_receipt(root, edge)
+            if to_id.startswith("claim:") and not _claim_page(root, to_id).is_file():
+                raise ValueError(f"create {to_id} before linking its trial evidence")
+        if not _check_edge_extension(root, edge, _read_edges(data)):
+            print(f"Edge already exists: {from_id} --{edge_type}--> {to_id}")
+            return
+        _append_graph(root, data, _render_edge(root, edge, evidence))
+        if edge_type in _EVIDENCE_OUTCOMES and to_id.startswith("claim:"):
+            rebuild_index(wiki_root)
+    print(f"Edge added: {from_id} --{edge_type}--> {to_id}")
+
+
+def _render_edge(root: Path, edge: dict, evidence: str) -> bytes:
+    from_id, to_id, edge_type = edge["from"], edge["to"], edge["type"]
     VALID_TYPES = {
         "extends", "contradicts", "addresses_gap", "inspired_by",
         "tested_by", "supports", "invalidates", "supersedes",
@@ -169,24 +374,6 @@ def add_edge(wiki_root: str, from_id: str, to_id: str, edge_type: str, evidence:
     if edge_type not in VALID_TYPES:
         print(f"Warning: unknown edge type '{edge_type}'. Valid: {VALID_TYPES}", file=sys.stderr)
 
-    edges_path = Path(wiki_root) / "graph" / "edges.jsonl"
-
-    # Dedup check
-    existing_edges = []
-    if edges_path.exists():
-        for line in _read_wiki_text(edges_path).strip().split("\n"):
-            if line.strip():
-                try:
-                    existing_edges.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-    # Check if edge already exists
-    for e in existing_edges:
-        if e.get("from") == from_id and e.get("to") == to_id and e.get("type") == edge_type:
-            print(f"Edge already exists: {from_id} --{edge_type}--> {to_id}")
-            return
-
     # Quarantine edge evidence (model/web-authored, re-read into context):
     # neutralize an injection payload but keep the edge structure intact.
     safe_evidence = evidence
@@ -197,7 +384,7 @@ def add_edge(wiki_root: str, from_id: str, to_id: str, edge_type: str, evidence:
             # Fail-closed WITH visibility: the graph gets the placeholder; the
             # raw flagged text + findings go to a reviewable quarantine log so a
             # human can inspect it. Nothing is silently dropped.
-            qlog = Path(wiki_root) / "graph" / "quarantine.log"
+            qlog = root / "graph" / "quarantine.log"
             with open(qlog, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
                     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -210,18 +397,9 @@ def add_edge(wiki_root: str, from_id: str, to_id: str, edge_type: str, evidence:
                   f"preserved in graph/quarantine.log for review.",
                   file=sys.stderr)
 
-    edge = {
-        "from": from_id,
-        "to": to_id,
-        "type": edge_type,
-        "evidence": safe_evidence,
-        "added": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-
-    with open(edges_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(edge, ensure_ascii=False) + "\n")
-
-    print(f"Edge added: {from_id} --{edge_type}--> {to_id}")
+    edge = dict(edge, evidence=safe_evidence,
+                added=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return (json.dumps(edge, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def rebuild_query_pack(wiki_root: str, max_chars: int = 8000):
@@ -393,21 +571,22 @@ def rebuild_query_pack(wiki_root: str, max_chars: int = 8000):
             sections.append(f"## Key Papers ({len(paper_summaries)} total)\n{papers_text}\n")
 
     # 5. Active relationship chains (900 chars)
-    edges_path = root / "graph" / "edges.jsonl"
-    if edges_path.exists():
-        edges = []
-        for line in _read_wiki_text(edges_path).strip().split("\n"):
-            if line.strip():
-                try:
-                    edges.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        if edges:
-            chains = []
-            for e in edges[-20:]:  # recent edges
-                chains.append(f"  {e['from']} --{e['type']}--> {e['to']}")
-            chains_text = "\n".join(chains)[:900]
-            sections.append(f"## Recent Relationships ({len(edges)} total)\n{chains_text}\n")
+    edges = _read_edges(_graph_bytes(root))
+    if edges:
+        chains = []
+        for edge in edges[-20:]:
+            label = edge["type"]
+            if label in _EVIDENCE_OUTCOMES:
+                if edge.get("legacy") or not _has_receipt_pin(edge):
+                    label += " [legacy]"
+                else:
+                    try:
+                        _require_trial_receipt(root, edge)
+                    except (OSError, ValueError):
+                        label += " [unverified]"
+            chains.append(f"  {edge['from']} --{label}--> {edge['to']}")
+        chains_text = "\n".join(chains)[:900]
+        sections.append(f"## Recent Relationships ({len(edges)} total)\n{chains_text}\n")
 
     # Assemble
     pack = "# Research Wiki Query Pack\n\n_Auto-generated. Do not edit._\n\n"
@@ -485,13 +664,18 @@ def get_stats(wiki_root: str):
     print(f"Ideas:       {ideas} ({count_by_field('ideas', 'outcome', 'negative')} failed, "
           f"{count_by_field('ideas', 'outcome', 'positive')} succeeded)")
     print(f"Experiments: {experiments}")
-    _claim_parts = []
-    for _st in sorted(_CLAIM_STATUSES):
-        _n = count_by_field('claims', 'status', _st)
-        if _n:
-            _claim_parts.append(f"{_n} {_st}")
+    edges = _read_edges(_graph_bytes(root))
+    states = [_claim_state(root, page, edges) for page in (root / "claims").glob("*.md")]
+    claim_parts = []
+    for status in ("open", "refuted", "supported"):
+        count = sum(state["status"] == status for state in states)
+        if count:
+            claim_parts.append(f"{count} {status}")
+    settled = sum(state["settled"] for state in states)
+    if settled:
+        claim_parts.append(f"{settled} settled")
     print(f"Claims:      {claims}"
-          + (f" ({', '.join(_claim_parts)})" if _claim_parts else ""))
+          + (f" ({', '.join(claim_parts)})" if claim_parts else ""))
     print(f"Edges:       {edge_count}")
     print(f"Wiki root:   {root}")
 
@@ -919,16 +1103,6 @@ def ingest_paper(wiki_root: str, *, arxiv_id: str = "", title: str = "",
     return page_path
 
 
-_CLAIM_STATUSES = {
-    "drafted",                 # written, not yet adversarially reviewed
-    "unproven",                # audited; proof has an open gap (not closed, not falsified)
-    "sound-modulo-imports",    # proof closes modulo flagged [unverified-axiom] imports
-    "verified",                # passed cross-model acquittal, imports discharged
-    "refuted",                 # a counterexample / jury falsified it
-    "retracted",               # withdrawn (e.g. superseded by a corrected claim)
-}
-
-
 def _claim_slugify(name: str, slug: str = "") -> str:
     """Slug for a claim page.
 
@@ -945,15 +1119,13 @@ def _claim_slugify(name: str, slug: str = "") -> str:
     return slugify(name).lstrip("_").lstrip("0").strip("_") or "claim"
 
 
-def _render_claim_page(slug: str, name: str, description: str, status: str,
+def _render_claim_page(slug: str, name: str, description: str, threshold: int,
                        provenance: str, statement: str, scope: str,
                        evidence: str, tags: list[str]) -> str:
     """Render a claims/<slug>.md page following the research-wiki schema.
 
-    Mirrors ``_render_paper_page``: ``---`` frontmatter block then body
-    sections. ``node_type: claim`` distinguishes the node kind; ``status``
-    is one of ``_CLAIM_STATUSES``; ``provenance`` points at the PROVE/JUDGE
-    run directory that produced the claim (the honesty receipt).
+    The page stores the statement, provenance and stopping rule. The index
+    and claim_status report the current verdict from the evidence graph.
     """
     lines = ["---"]
     lines.append("type: claim")
@@ -961,7 +1133,7 @@ def _render_claim_page(slug: str, name: str, description: str, status: str,
     lines.append(f"name: {_yaml_quote(name)}")
     lines.append(f"description: {_yaml_quote(description)}")
     lines.append("node_type: claim")
-    lines.append(f"status: {status}")
+    lines.append(f"evidence_threshold: {threshold}")
     lines.append(f"provenance: {_yaml_quote(provenance)}")
     lines.append("tags: [" + ", ".join(_yaml_quote(t) for t in tags) + "]")
     lines.append(f"date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
@@ -969,8 +1141,6 @@ def _render_claim_page(slug: str, name: str, description: str, status: str,
     lines.append("---")
     lines.append("")
     lines.append(f"# {name}")
-    lines.append("")
-    lines.append(f"**status:** `{status}`")
     lines.append("")
     lines.append("## Statement")
     lines.append(statement.strip() if statement.strip() else "_TODO: formal statement._")
@@ -990,7 +1160,8 @@ def _render_claim_page(slug: str, name: str, description: str, status: str,
 
 
 def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
-              status: str = "drafted", provenance: str = "",
+              status: str | None = None, evidence_threshold: int | None = None,
+              provenance: str = "",
               statement: str = "", scope: str = "", evidence: str = "",
               tags: list[str] | None = None,
               addresses: list[str] | None = None,
@@ -1001,9 +1172,8 @@ def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
               update_on_exist: bool = False) -> Path:
     """Create (or update) a claims/<slug>.md node and wire its edges.
 
-    The claim layer is the PROVE/JUDGE output ledger: every theorem/headline
-    becomes a node with an HONEST ``status`` (one of ``_CLAIM_STATUSES``) and a
-    ``provenance`` pointer to the run directory. Mirrors ``ingest_paper``:
+    The page can carry a provenance pointer to the run directory. The graph
+    supplies the empirical status. Mirrors ``ingest_paper``:
       - writes claims/<slug>.md from the schema above
       - dedups by slug (``update_on_exist=False`` skips an existing page)
       - records typed edges into graph/edges.jsonl via ``add_edge``:
@@ -1021,63 +1191,18 @@ def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
         raise RuntimeError(f"{root} is not an initialized wiki (claims/ missing). "
                            f"Run `init` first.")
 
-    if status not in _CLAIM_STATUSES:
-        raise RuntimeError(f"unknown claim status '{status}'. "
-                           f"Valid: {sorted(_CLAIM_STATUSES)}")
+    if status is not None:
+        raise ValueError("claim status is derived from verified trial receipts")
+    if evidence_threshold is not None and (type(evidence_threshold) is not int
+                                           or evidence_threshold < 1):
+        raise ValueError("claim evidence threshold must be a positive integer")
 
     tags = tags or []
     slug = _claim_slugify(name, slug)
     node_id = f"claim:{slug}"
 
-    page_path = root / "claims" / f"{slug}.md"
-    if page_path.exists() and not update_on_exist:
-        append_log(str(root), f"add_claim: skipped existing claim "
-                              f"{page_path.name} (slug dedup)")
-        print(f"Claim already exists: {page_path.name} (slug dedup) — skipping.")
-        return page_path
-    was_update = page_path.exists()
+    page_path = _claim_page(root, node_id)
 
-    # Quarantine claim body fields before persist (model-authored text that is
-    # re-read into agent context via index/query_pack): same Layer-1 injection
-    # hygiene as edge evidence above. Placeholder persists; raw text goes to
-    # graph/quarantine.log for human review — nothing silently dropped.
-    if quarantine is not None:
-        _q_hits = []
-
-        def _q(val, field):
-            if not val:
-                return val
-            safe, findings = quarantine(val, scope="strict",
-                                        label=f"claim {slug}.{field}")
-            if findings:
-                _q_hits.append((field, findings, val))
-            return safe
-
-        description = _q(description, "description")
-        statement = _q(statement, "statement")
-        scope = _q(scope, "scope")
-        evidence = _q(evidence, "evidence")
-        if _q_hits:
-            qlog = root / "graph" / "quarantine.log"
-            qlog.parent.mkdir(parents=True, exist_ok=True)
-            with open(qlog, "a", encoding="utf-8") as f:
-                for field, findings, raw in _q_hits:
-                    f.write(json.dumps({
-                        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "claim": node_id, "field": field,
-                        "findings": findings, "raw_text": raw,
-                    }, ensure_ascii=False) + "\n")
-            print(f"⚠️  claim field(s) quarantined "
-                  f"({', '.join(f for f, _, _ in _q_hits)}); placeholder persisted, "
-                  f"raw text preserved in graph/quarantine.log for review.",
-                  file=sys.stderr)
-
-    rendered = _render_claim_page(slug, name, description, status, provenance,
-                                  statement, scope, evidence, tags)
-    page_path.write_text(rendered, encoding="utf-8")
-
-    # Wire edges. Reuse add_edge so dedup, evidence quarantine, and the JSONL
-    # format are all identical to paper/idea edges.
     def _norm(target: str, default_prefix: str) -> str:
         t = target.strip()
         if not t:
@@ -1109,41 +1234,89 @@ def add_claim(wiki_root: str, slug: str, name: str, *, description: str = "",
                   f"(dangling edge recorded — create the node or fix the id).",
                   file=sys.stderr)
 
-    for tgt in (addresses or []):
-        _tid = _norm(tgt, "gap:")
-        _warn_if_dangling(_tid)
-        add_edge(str(root), node_id, _tid, "addresses_gap",
-                 evidence=f"claim {slug} addresses gap")
-    for tgt in (extends or []):
-        _tid = _norm(tgt, "paper:")
-        _warn_if_dangling(_tid)
-        add_edge(str(root), node_id, _tid, "extends",
-                 evidence=f"claim {slug} extends paper")
-    for tgt in (uses or []):
-        _tid = _norm(tgt, "paper:")
-        _warn_if_dangling(_tid)
-        add_edge(str(root), node_id, _tid, "uses",
-                 evidence=f"claim {slug} uses paper")
-    for tgt in (depends_on or []):
-        _tid = _norm(tgt, "claim:")
-        _warn_if_dangling(_tid)
-        add_edge(str(root), node_id, _tid, "depends_on",
-                 evidence=f"claim {slug} depends on claim")
-    for tgt in (refutes or []):
-        _tid = _norm(tgt, "claim:")
-        _warn_if_dangling(_tid)
-        add_edge(str(root), node_id, _tid, "refutes",
-                 evidence=f"claim {slug} refutes claim")
+    with _graph_lock(root):
+        if page_path.exists() and not update_on_exist:
+            append_log(str(root), f"add_claim: skipped existing claim "
+                                  f"{page_path.name} (slug dedup)")
+            print(f"Claim already exists: {page_path.name} (slug dedup) — skipping.")
+            return page_path
+        was_update = page_path.exists()
 
-    # Rebuild derived artifacts (same as ingest_paper)
-    rebuild_index(str(root))
-    rebuild_query_pack(str(root))
+        existing_threshold = int(_load_paper_frontmatter(page_path).get(
+            "evidence_threshold", _DEFAULT_EVIDENCE_THRESHOLD))
+        if was_update and evidence_threshold is not None and evidence_threshold != existing_threshold:
+            raise ValueError("claim evidence threshold is fixed when the claim is created")
+        threshold = evidence_threshold if evidence_threshold is not None else existing_threshold
 
-    action = "updated" if was_update else "added"
-    append_log(str(root), f"add_claim: {action} {node_id} [status={status}]"
-                          + (f" prov={provenance}" if provenance else ""))
-    print(f"Claim {action}: {page_path} [status={status}]")
-    return page_path
+        data = _graph_bytes(root)
+        existing = _read_edges(data)
+        new_edges = []
+        for edge_type, targets, prefix, note in (
+            ("addresses_gap", addresses, "gap:", "addresses gap"),
+            ("extends", extends, "paper:", "extends paper"),
+            ("uses", uses, "paper:", "uses paper"),
+            ("depends_on", depends_on, "claim:", "depends on claim"),
+            ("refutes", refutes, "claim:", "refutes claim"),
+        ):
+            for target in targets or []:
+                target_id = _norm(target, prefix)
+                _warn_if_dangling(target_id)
+                edge = {"from": node_id, "to": target_id, "type": edge_type}
+                if _check_edge_extension(root, edge, existing):
+                    new_edges.append((edge, f"claim {slug} {note}"))
+                    existing.append(edge)
+
+        # Quarantine claim body fields before persist (model-authored text that is
+        # re-read into agent context via index/query_pack): same Layer-1 injection
+        # hygiene as edge evidence above. Placeholder persists; raw text goes to
+        # graph/quarantine.log for human review — nothing silently dropped.
+        if quarantine is not None:
+            _q_hits = []
+
+            def _q(val, field):
+                if not val:
+                    return val
+                safe, findings = quarantine(val, scope="strict",
+                                            label=f"claim {slug}.{field}")
+                if findings:
+                    _q_hits.append((field, findings, val))
+                return safe
+
+            description = _q(description, "description")
+            statement = _q(statement, "statement")
+            scope = _q(scope, "scope")
+            evidence = _q(evidence, "evidence")
+            if _q_hits:
+                qlog = root / "graph" / "quarantine.log"
+                qlog.parent.mkdir(parents=True, exist_ok=True)
+                with open(qlog, "a", encoding="utf-8") as f:
+                    for field, findings, raw in _q_hits:
+                        f.write(json.dumps({
+                            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "claim": node_id, "field": field,
+                            "findings": findings, "raw_text": raw,
+                        }, ensure_ascii=False) + "\n")
+                print(f"⚠️  claim field(s) quarantined "
+                      f"({', '.join(f for f, _, _ in _q_hits)}); placeholder persisted, "
+                      f"raw text preserved in graph/quarantine.log for review.",
+                      file=sys.stderr)
+
+        rendered = _render_claim_page(slug, name, description, threshold, provenance,
+                                      statement, scope, evidence, tags)
+        lines = [_render_edge(root, edge, note) for edge, note in new_edges]
+        _replace_file(page_path, rendered.encode("utf-8"))
+        if lines:
+            _append_graph(root, data, b"".join(lines))
+
+        # Rebuild derived artifacts (same as ingest_paper)
+        rebuild_index(str(root))
+        rebuild_query_pack(str(root))
+
+        action = "updated" if was_update else "added"
+        append_log(str(root), f"add_claim: {action} {node_id}"
+                              + (f" prov={provenance}" if provenance else ""))
+        print(f"Claim {action}: {page_path}")
+        return page_path
 
 
 _IDEA_OUTCOMES = {
@@ -1478,19 +1651,44 @@ def add_experiment(wiki_root: str, slug: str, *, title: str = "", idea: str = ""
     return page_path
 
 
+def _score_receipt_fields(raw: bytes, contract: str) -> dict:
+    """Return the ledger fields authenticated by a frozen score receipt."""
+    try:
+        from .eval_contract import SHA256, parse_json, valid_metrics
+    except ImportError:
+        from eval_contract import SHA256, parse_json, valid_metrics
+
+    score = parse_json(raw)
+    if (not isinstance(score, dict) or score.get("schema") != 1 or
+            score.get("contract_sha256") != contract or
+            not SHA256.fullmatch(str(score.get("artifact_sha256"))) or
+            score.get("status") not in ("pass", "below_threshold", "error")):
+        raise ValueError("score receipt must belong to the pinned contract")
+    fields = dict(outcome=score["status"], artifact_sha256=score["artifact_sha256"])
+    if score["status"] != "error":
+        metrics = [score.get(key) for key in ("baseline", "metrics", "delta")]
+        if (not all(valid_metrics(value) for value in metrics) or
+                not metrics[0].keys() == metrics[1].keys() == metrics[2].keys() or
+                not isinstance(score.get("primary_metric"), str) or
+                score["primary_metric"] not in metrics[0]):
+            raise ValueError("score receipt is missing frozen numeric metrics")
+        fields.update(baseline=score["baseline"], metrics=score["metrics"], delta=score["delta"])
+    return fields
+
+
 def record_trial(root: Path, trial_id: str, contract: str, *, hypothesis: str,
                  change: str, scope: str, cause: str, cause_status: str, revision: str,
                  receipt: Path | None, failed_log: Path | None) -> Path:
     """Keep one immutable evidence record per attempt, including unscored runs."""
-    # Load only for this subcommand so existing standalone wiki copies still run.
+    # Keep the evaluator dependency lazy for standalone wiki installations.
     try:
-        from .eval_contract import SHA256, file_digest, parse_json, valid_metrics, write_once_json
+        from .eval_contract import SHA256, file_digest, write_once_json
     except ImportError:
-        from eval_contract import SHA256, file_digest, parse_json, valid_metrics, write_once_json
+        from eval_contract import SHA256, file_digest, write_once_json
 
     if not (root / "experiments").is_dir():
         raise ValueError("initialize the research wiki before recording a trial")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", trial_id):
+    if not _TRIAL_ID.fullmatch(trial_id):
         raise ValueError("trial id must use lowercase letters, digits, dashes or underscores")
     if not SHA256.fullmatch(contract):
         raise ValueError("expected a pinned SHA-256 for the evaluation contract")
@@ -1511,21 +1709,7 @@ def record_trial(root: Path, trial_id: str, contract: str, *, hypothesis: str,
                   outcome="unscored", delta=None, cause_status=cause_status,
                   evidence=evidence_path, evidence_sha256=evidence_digest)
     if raw is not None:
-        score = parse_json(raw)
-        if (not isinstance(score, dict) or score.get("schema") != 1 or
-                score.get("contract_sha256") != contract or
-                not SHA256.fullmatch(str(score.get("artifact_sha256"))) or
-                score.get("status") not in ("pass", "below_threshold", "error")):
-            raise ValueError("score receipt must belong to the pinned contract")
-        if score["status"] != "error":
-            metrics = [score.get(key) for key in ("baseline", "metrics", "delta")]
-            if (not all(valid_metrics(value) for value in metrics) or
-                    not metrics[0].keys() == metrics[1].keys() == metrics[2].keys() or
-                    not isinstance(score.get("primary_metric"), str) or
-                    score["primary_metric"] not in metrics[0]):
-                raise ValueError("score receipt is missing frozen numeric metrics")
-            record.update(baseline=score["baseline"], metrics=score["metrics"], delta=score["delta"])
-        record.update(outcome=score["status"], artifact_sha256=score["artifact_sha256"])
+        record.update(_score_receipt_fields(raw, contract))
     output = root / "trials" / f"{trial_id}.json"
     write_once_json(output, record)
     rebuild_index(str(root))
@@ -1571,6 +1755,7 @@ def rebuild_index(wiki_root: str) -> None:
     root = Path(wiki_root)
     lines = ["# Research Wiki Index", "",
              "_Auto-generated by `research_wiki.py rebuild_index`. Do not edit._", ""]
+    edges = _read_edges(_graph_bytes(root))
 
     for subdir, header in [("papers", "Papers"), ("ideas", "Ideas"),
                             ("experiments", "Experiments"), ("claims", "Claims")]:
@@ -1585,8 +1770,13 @@ def rebuild_index(wiki_root: str) -> None:
             # so each node type renders its human label without special-casing.
             title = meta.get("title") or meta.get("name") or f.stem
             year = meta.get("year", "")
-            # Surface the claim's honesty status inline (papers have no status).
             status = meta.get("status", "")
+            if subdir == "claims":
+                try:
+                    state = _claim_state(root, f, edges)
+                    status = state["status"] + (", settled" if state["settled"] else "")
+                except (OSError, ValueError):
+                    status = "evidence unavailable"
             suffix = f" ({year})" if year else (f" [{status}]" if status else "")
             entries.append(f"- `{node_id}` — {title}{suffix}")
         if entries:
@@ -1646,6 +1836,16 @@ def main():
     p_edge.add_argument("--to", dest="to_id", required=True)
     p_edge.add_argument("--type", dest="edge_type", required=True)
     p_edge.add_argument("--evidence", default="")
+    p_edge.add_argument("--trial-id", help="Trial record for supports/invalidates")
+    p_edge.add_argument("--receipt-sha256", help="SHA-256 of the trial's score receipt")
+
+    p_state = subparsers.add_parser("claim_status", help="Report verified claim evidence as JSON")
+    p_state.add_argument("wiki_root")
+    p_state.add_argument("--slug", required=True)
+
+    p_migrate = subparsers.add_parser("migrate_evidence", help="Mark legacy evidence edges")
+    p_migrate.add_argument("wiki_root")
+    p_migrate.add_argument("--dry-run", action="store_true")
 
     # rebuild_query_pack
     p_qp = subparsers.add_parser("rebuild_query_pack")
@@ -1695,8 +1895,8 @@ def main():
                          help="Human-readable claim name/headline")
     p_claim.add_argument("--description", default="",
                          help="One-line description for the index/frontmatter")
-    p_claim.add_argument("--status", default="drafted",
-                         help="One of: " + ", ".join(sorted(_CLAIM_STATUSES)))
+    p_claim.add_argument("--evidence-threshold", type=int,
+                         help="Minimum absolute net verified receipts to settle (default: 2)")
     p_claim.add_argument("--provenance", default="",
                          help="Run directory that produced this claim (honesty receipt)")
     p_claim.add_argument("--statement", default="", help="Formal statement (body)")
@@ -1788,7 +1988,22 @@ def main():
     elif args.command == "slug":
         print(slugify(args.title, args.author, args.year))
     elif args.command == "add_edge":
-        add_edge(args.wiki_root, args.from_id, args.to_id, args.edge_type, args.evidence)
+        try:
+            add_edge(args.wiki_root, args.from_id, args.to_id, args.edge_type, args.evidence,
+                     trial_id=args.trial_id, receipt_sha256=args.receipt_sha256)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    elif args.command == "claim_status":
+        try:
+            print(json.dumps(claim_status(args.wiki_root, args.slug), sort_keys=True))
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    elif args.command == "migrate_evidence":
+        try:
+            count = migrate_evidence(args.wiki_root, dry_run=args.dry_run)
+            print(f"{'Would mark' if args.dry_run else 'Marked'} {count} legacy evidence edge(s)")
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     elif args.command == "rebuild_query_pack":
         rebuild_query_pack(args.wiki_root, args.max_chars)
     elif args.command == "rebuild_index":
@@ -1808,15 +2023,18 @@ def main():
     elif args.command == "add_claim":
         def _split(s: str) -> list[str]:
             return [x.strip() for x in s.split(",") if x.strip()]
-        add_claim(args.wiki_root, args.slug, args.name,
-                  description=args.description, status=args.status,
-                  provenance=args.provenance, statement=args.statement,
-                  scope=args.scope, evidence=args.evidence,
-                  tags=_split(args.tags),
-                  addresses=_split(args.addresses), extends=_split(args.extends),
-                  uses=_split(args.uses), depends_on=_split(args.depends_on),
-                  refutes=_split(args.refutes),
-                  update_on_exist=args.update_on_exist)
+        try:
+            add_claim(args.wiki_root, args.slug, args.name,
+                      description=args.description, evidence_threshold=args.evidence_threshold,
+                      provenance=args.provenance, statement=args.statement,
+                      scope=args.scope, evidence=args.evidence,
+                      tags=_split(args.tags),
+                      addresses=_split(args.addresses), extends=_split(args.extends),
+                      uses=_split(args.uses), depends_on=_split(args.depends_on),
+                      refutes=_split(args.refutes),
+                      update_on_exist=args.update_on_exist)
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
     elif args.command == "upsert_idea":
         def _spliti(s: str) -> list[str]:
             return [x.strip() for x in s.split(",") if x.strip()]

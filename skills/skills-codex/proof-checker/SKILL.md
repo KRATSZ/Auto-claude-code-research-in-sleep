@@ -447,9 +447,8 @@ If — and only if — a `research-wiki/` exists, persist each top-level theorem
 as a **claim node** (the wiki's PROVE/JUDGE ledger). This is the **birth point** for wiki
 claim nodes. It is a **detect-only record, never a verdict**: it never changes the audit's
 `verdict`/`reason_code`, never blocks, and is skipped when `verdict == NOT_APPLICABLE` or no
-wiki is found. The claim's `status` is the **PROOF axis only** ({drafted, unproven,
-sound-modulo-imports, verified, refuted, retracted}); empirical experiment support is a
-separate axis carried by edges (`/result-to-claim`), never written into `status`.
+wiki is found. Record proof findings and the audit pointer in the evidence chain.
+The graph derives the claim's empirical status from scored trial receipts.
 
 Resolve the helper via the Codex-side chain (skip cleanly if unavailable; the audit is
 already complete):
@@ -462,15 +461,16 @@ WIKI_SCRIPT=""
 ```
 
 If `research-wiki/` exists and `WIKI_SCRIPT` is available and `verdict != NOT_APPLICABLE`,
-for each top-level theorem map the audit outcome to an honest status — `PASS`/all proofs
+for each top-level theorem map the audit outcome to a proof finding — `PASS`/all proofs
 complete → `verified`; closes modulo flagged imports → `sound-modulo-imports`; counterexample
 found or statement judged false → `refuted`; open gap (UNJUSTIFIED, no counterexample) →
 `unproven` (never fake a gap as `refuted`/`verified`) — then record it (idempotent):
 ```
 python3 "$WIKI_SCRIPT" add_claim research-wiki/ --slug "<stable-theorem-id>" \
-     --name "<theorem headline>" --status "<mapped status>" \
+     --name "<theorem headline>" \
      --provenance "<trace_path from PROOF_AUDIT.json>" --statement "<canonical statement>" \
-     --scope "<what it does NOT say; flagged imports>" --update-on-exist
+     --scope "<statement scope and flagged imports>" \
+     --evidence "<proof finding and audit pointers>" --update-on-exist
 ```
 `add_claim` failure is non-fatal (warn and continue; the audit is unaffected).
 

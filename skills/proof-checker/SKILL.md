@@ -605,11 +605,8 @@ was proven and with what honesty. This is the **birth point** for wiki claim nod
 changes the audit's `verdict`/`reason_code`, never blocks, and is skipped entirely
 when `verdict == NOT_APPLICABLE` (no theorems) or no wiki is found.
 
-> The claim's `status` is the **PROOF axis only** (`verified` / `sound-modulo-imports`
-> / `refuted` / `unproven` / `drafted` / `retracted`). Empirical experiment support is
-> a **separate axis** carried by `supports` / `invalidates` *edges* from
-> `/result-to-claim` — those words are NEVER written into this `status` field (the
-> `research_wiki.py` validator rejects them).
+Record proof findings and the audit pointer in the claim's evidence chain.
+The graph derives the claim's empirical status from scored trial receipts.
 
 Resolve the helper via the **canonical resolver** (integration-contract §2). Check
 `NOT_APPLICABLE` first (in cwd, where the audit ran), then run from the project root
@@ -635,32 +632,31 @@ WIKI_SCRIPT=".aris/tools/research_wiki.py"
 
 For each top-level theorem/headline in `PROOF_SKELETON.md` (the main theorem + the
 key lemmas the headline depends on — NOT every micro-claim), map the audit outcome
-to an **honest** claim status:
+to a proof finding for the evidence chain:
 
-| Audit outcome (`PROOF_AUDIT.json` verdict + Phase 1.5 counterexamples) | `--status` |
+| Audit outcome (`PROOF_AUDIT.json` verdict + Phase 1.5 counterexamples) | Proof finding |
 |---|---|
 | `verdict=PASS` / `all_proofs_complete`, no flagged imports | `verified` |
 | proof closes but rests on a flagged `[unverified-axiom]` / imported result | `sound-modulo-imports` |
 | counterexample found (Phase 1.5) **or** reviewer judged the statement false | `refuted` |
 | open gap (unresolved FATAL/CRITICAL / UNJUSTIFIED, no counterexample) | `unproven` |
 
-Never invent a status: a plain proof gap is `unproven` — never `refuted` (which
+Record a plain proof gap as `unproven` — never `refuted` (which
 asserts falsity) and never `verified`/`drafted`. Then record (idempotent):
 
 ```bash
 python3 "$WIKI_SCRIPT" add_claim research-wiki/ \
   --slug "<stable-theorem-id, e.g. thm-main-ub>" --name "<theorem headline>" \
-  --status "<mapped status>" --provenance "<trace_path from PROOF_AUDIT.json>" \
+  --provenance "<trace_path from PROOF_AUDIT.json>" \
   --statement "<canonical theorem statement>" \
   --scope "<what it does NOT say; any flagged imports>" \
-  --evidence "<PROOF_AUDIT.json verdict + counterexample / obligation pointers>" \
+  --evidence "<proof finding, PROOF_AUDIT.json verdict + counterexample / obligation pointers>" \
   --update-on-exist \
-  || echo "WARN: add_claim failed for <slug> (audit unaffected; fix wiki/status and re-run)" >&2
+  || echo "WARN: add_claim failed for <slug> (audit unaffected; fix the wiki error and re-run)" >&2
 ```
 
-`--update-on-exist` lets a re-audit refresh a claim's status (an `unproven` claim
-becomes `verified` once the gap closes). `--provenance` is the honesty receipt (the
-`trace_path`); never omit it.
+Use `--update-on-exist` to refresh the evidence notes and `--provenance`
+to point to the current audit trace.
 
 ## Deep-Fix Mode (opt-in)
 

@@ -79,7 +79,7 @@ def test_research_wiki_integration():
         assert "exfiltrate" not in poisoned["evidence"] and "ignore all" not in poisoned["evidence"]
         qlog = (Path(root) / "graph" / "quarantine.log").read_text()
         assert "ignore all previous instructions" in qlog            # raw preserved for review
-        rw.add_edge(root, "paper:c", "paper:d", "supports",
+        rw.add_edge(root, "paper:c", "paper:d", "extends",
                     evidence="Table 3 shows a 4-point mAP gain.")
         edges = [json.loads(l) for l in (Path(root) / "graph" / "edges.jsonl").read_text().splitlines() if l.strip()]
         assert edges[-1]["evidence"] == "Table 3 shows a 4-point mAP gain."  # clean preserved verbatim
