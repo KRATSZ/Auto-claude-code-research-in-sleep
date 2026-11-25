@@ -180,6 +180,17 @@ You must `retry` when the submission file is missing or invalid, the
 evaluation script fails, or a result has no matching trial receipt. Decisions
 are appended to `decisions` in the run state, which is the decision trace.
 
+## Cleanup (end of run, automatic)
+
+After Stage 4, keep disk use bounded:
+
+```bash
+python3 "${ARIS_REPO:-.}/tools/artifact_gc.py" . --apply   # default: cap 2 GB, drop items older than 14 days
+```
+
+Only `.aris/cache`, `.aris/traces`, `.aris/snapshots` are touched. Anything cited
+by a run state or the Research Wiki is kept. Report the freed size in one line.
+
 ## Research cycle mode
 
 With `research-cycle: true`, start with [data-probe](../data-probe/SKILL.md) on
