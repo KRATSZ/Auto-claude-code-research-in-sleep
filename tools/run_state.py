@@ -327,6 +327,68 @@ def mark_provisional(root: str, run_id: str, phase: str, verdict_id: str,
         return state
 
 
+INTAKE_FIELDS = ("goal", "budget", "compute", "data_access", "write_paper", "metric")
+STAGE_VERDICTS = {"accept", "retry", "reject"}
+DEFAULT_MAX_RETRIES = 2
+
+
+def record_intake(root: str, run_id: str, answers: dict) -> dict:
+    """Merge up-front Intake answers into the run; empty values are ignored."""
+    unknown = set(answers) - set(INTAKE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown intake fields: {sorted(unknown)}")
+    with _lock(root, run_id):
+        state = _load(root, run_id)
+        intake = state.setdefault("intake", {})
+        intake.update({k: v for k, v in answers.items() if v not in (None, "")})
+        _save(root, run_id, state)
+        return state
+
+
+def missing_intake(root: str, run_id: str) -> list[str]:
+    """Intake fields still unanswered — ask these once, before Stage 1."""
+    intake = _load(root, run_id).get("intake", {})
+    return [f for f in INTAKE_FIELDS if intake.get(f) in (None, "")]
+
+
+def stage_gate(root: str, run_id: str, phase: str, verdict: str, reason: str,
+               max_retries: Optional[int] = None) -> dict:
+    """Record an accept/retry/reject decision for a phase (append-only trace).
+
+    retry beyond the retry budget is escalated to reject. A gate decision does
+    NOT acquit a phase: cross-model acceptance still goes through ``accept``.
+    Returns the decision entry; ``effective`` is what the pipeline must do.
+    """
+    if verdict not in STAGE_VERDICTS:
+        raise ValueError(f"stage verdict must be one of {sorted(STAGE_VERDICTS)}")
+    if not reason or not reason.strip():
+        raise ValueError("stage gate needs a one-line reason")
+    with _lock(root, run_id):
+        state = _load(root, run_id)
+        ph = _find_phase(state, phase)
+        limit = max_retries if max_retries is not None else int(
+            state.get("policy", {}).get("max_retries", DEFAULT_MAX_RETRIES))
+        if limit < 0:
+            raise ValueError("max_retries must be >= 0")
+        effective = verdict
+        if verdict == "retry":
+            if ph.get("retries", 0) >= limit:
+                effective = "reject"
+                reason = f"{reason} (retry limit {limit} reached)"
+            else:
+                ph["retries"] = ph.get("retries", 0) + 1
+                ph["status"] = "pending"
+        if effective == "reject":
+            ph["status"] = "failed"
+        entry = {"phase": phase, "verdict": verdict, "effective": effective,
+                 "reason": reason.strip(), "retries": ph.get("retries", 0),
+                 "at": _now()}
+        state.setdefault("decisions", []).append(entry)
+        ph["updated"] = _now()
+        _save(root, run_id, state)
+        return entry
+
+
 def resume_point(root: str, run_id: str) -> Optional[dict]:
     """First phase whose status is NOT terminal — the resume
     target — or None if the run is complete.
@@ -367,6 +429,10 @@ def main() -> int:
     s = sub.add_parser("resume"); s.add_argument("root"); s.add_argument("run_id")
     s = sub.add_parser("status"); s.add_argument("root"); s.add_argument("run_id")
     s = sub.add_parser("list"); s.add_argument("root")
+    s = sub.add_parser("intake", help="record up-front answers; prints still-missing fields"); s.add_argument("root"); s.add_argument("run_id")
+    for f in INTAKE_FIELDS:
+        s.add_argument(f"--{f.replace('_', '-')}", dest=f)
+    s = sub.add_parser("gate", help="stage gate: accept / retry / reject"); s.add_argument("root"); s.add_argument("run_id"); s.add_argument("phase"); s.add_argument("verdict", choices=sorted(STAGE_VERDICTS)); s.add_argument("--reason", required=True); s.add_argument("--max-retries", type=int)
     a = ap.parse_args()
 
     try:
@@ -390,6 +456,14 @@ def main() -> int:
             d = Path(a.root) / ".aris" / "runs"
             for f in sorted(d.glob("*.json")) if d.exists() else []:
                 print(f.stem)
+        elif a.cmd == "intake":
+            record_intake(a.root, a.run_id, {f: getattr(a, f) for f in INTAKE_FIELDS})
+            missing = missing_intake(a.root, a.run_id)
+            print("missing: " + (",".join(missing) if missing else "none"))
+        elif a.cmd == "gate":
+            entry = stage_gate(a.root, a.run_id, a.phase, a.verdict, a.reason, a.max_retries)
+            print(entry["effective"])  # machine-readable: what the pipeline must do
+            print(json.dumps(entry, ensure_ascii=False), file=sys.stderr)
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

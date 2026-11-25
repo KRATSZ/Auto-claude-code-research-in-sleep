@@ -134,6 +134,52 @@ completion. After each tick run `iteration_log.py note <root> <run_id> <phase>
 `pivot=human` surfaces the stall. Neither result is a quality verdict. See
 [`resumable-runs.md`](../shared-references/resumable-runs.md).
 
+## Single entry point
+
+`/research-pipeline` is the one recommended way to start research. The other
+skills are called by this pipeline internally, or are advanced standalone tools.
+Users should not need to pick among them.
+
+## Intake (before Stage 1, ask once)
+
+Start the run with `python3 "$RUN_STATE" start`, then record whatever
+`$ARGUMENTS` already answers:
+
+```bash
+python3 "$RUN_STATE" intake . <run_id> --goal "..." --budget "..." \
+  --compute "..." --data-access "..." --write-paper "yes|no" --metric "..."
+# prints: missing: <fields>   (or: missing: none)
+```
+
+Ask the user about the still-missing fields **in one message**, record the
+answers, and do not ask about them again. If `metric` is given, freeze it with
+`eval-contract` before Stage 2. Later stages read these values from the run
+state.
+
+After Intake, ask the user again only when the run would exceed the budget,
+needs a new resource (data, GPU, account), or is about to take a
+hard-to-reverse action. Every other checkpoint follows `AUTO_PROCEED`.
+
+## Stage Gate (end of every stage)
+
+After each stage, record exactly one decision and a one-line reason:
+
+```bash
+python3 "$RUN_STATE" gate . <run_id> <phase> accept|retry|reject --reason "..."
+# prints the effective decision: accept | retry | reject
+```
+
+- `accept`: go to the next stage. The gate does not replace cross-model
+  `accept`; phase acceptance still needs a reviewer verdict.
+- `retry`: redo this stage with the failure reason in context. Retries are
+  capped (default 2, `--max-retries N`); past the cap the tool returns `reject`.
+- `reject`: stop or go back one stage, and tell the user why in one plain
+  sentence.
+
+You must `retry` when the submission file is missing or invalid, the
+evaluation script fails, or a result has no matching trial receipt. Decisions
+are appended to `decisions` in the run state, which is the decision trace.
+
 ## Research cycle mode
 
 With `research-cycle: true`, start with [data-probe](../data-probe/SKILL.md) on
